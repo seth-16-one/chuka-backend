@@ -1,0 +1,55 @@
+services:
+  - type: web
+    name: chuka-backend
+    runtime: node
+    rootDir: chuka-backend
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        sync: false
+      - key: CORS_ORIGIN
+        sync: false
+      - key: APP_BASE_URL
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_ANON_KEY
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: OTP_HASH_SECRET
+        sync: false
+      - key: OTP_EXPIRY_MINUTES
+        value: "10"
+      - key: OTP_MAX_ATTEMPTS
+        value: "5"
+      - key: OTP_REQUEST_LIMIT
+        value: "3"
+      - key: OTP_REQUEST_WINDOW_MINUTES
+        value: "15"
+      - key: EMAIL_PROVIDER
+        value: smtp
+      - key: EMAIL_FROM_NAME
+        value: Chuka University App
+      - key: EMAIL_FROM_ADDRESS
+        sync: false
+      - key: SMTP_HOST
+        value: smtp.gmail.com
+      - key: SMTP_PORT
+        value: "465"
+      - key: SMTP_SECURE
+        value: "true"
+      - key: SMTP_USER
+        sync: false
+      - key: SMTP_PASS
+        sync: false
+      - key: RESEND_API_KEY
+        sync: false
+      - key: SENDGRID_API_KEY
+        sync: false

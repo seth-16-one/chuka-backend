@@ -1,0 +1,21 @@
+{
+  "name": "chuka-backend",
+  "version": "1.0.0",
+  "description": "Dedicated backend for Chuka University App",
+  "main": "src/server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node src/server.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.49.8",
+    "cors": "^2.8.5",
+    "dotenv": "^17.3.1",
+    "express": "^5.1.0",
+    "nodemailer": "^6.10.1"
+  }
+}
