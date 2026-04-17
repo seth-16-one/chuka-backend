@@ -105,23 +105,53 @@ async function resolveLoginEmail(identifier) {
   let loginEmail = normalizeEmail(normalized);
 
   if (!loginEmail.includes('@')) {
-    const { data: profile, error: profileError } = await adminClient
+    const normalizedLower = normalized.toLowerCase();
+
+    const { data: regProfile, error: regProfileError } = await adminClient
       .from('profiles')
       .select('email')
       .eq('reg_number', normalized)
       .maybeSingle();
 
-    if (profileError) {
-      throw profileError;
+    if (regProfileError) {
+      throw regProfileError;
     }
 
-    if (!profile?.email) {
-      const error = new Error('No account found for that registration number.');
-      error.statusCode = 404;
-      throw error;
+    if (regProfile?.email) {
+      return normalizeEmail(regProfile.email);
     }
 
-    loginEmail = normalizeEmail(profile.email);
+    const { data: nameProfile, error: nameProfileError } = await adminClient
+      .from('profiles')
+      .select('email')
+      .ilike('full_name', normalized)
+      .maybeSingle();
+
+    if (nameProfileError) {
+      throw nameProfileError;
+    }
+
+    if (nameProfile?.email) {
+      return normalizeEmail(nameProfile.email);
+    }
+
+    const { data: aliasProfile, error: aliasProfileError } = await adminClient
+      .from('profiles')
+      .select('email')
+      .ilike('email', `${normalizedLower}@%`)
+      .maybeSingle();
+
+    if (aliasProfileError) {
+      throw aliasProfileError;
+    }
+
+    if (aliasProfile?.email) {
+      return normalizeEmail(aliasProfile.email);
+    }
+
+    const error = new Error('No account found for that username, email, or registration number.');
+    error.statusCode = 404;
+    throw error;
   }
 
   return loginEmail;
@@ -258,11 +288,17 @@ router.post('/auth/register', async (req, res) => {
     const fullName = String(req.body.fullName || '').trim();
     const regNumber = String(req.body.regNumber || '').trim();
     const department = String(req.body.department || '').trim();
-    const challengeId = String(req.body.challengeId || '').trim();
-    const otpCode = String(req.body.otpCode || '').trim();
+    const missingFields = [];
 
-    if (!email || !password || !fullName || !regNumber || !challengeId || !otpCode) {
-      return res.status(400).json({ error: 'Missing required registration fields.' });
+    if (!email) missingFields.push('email');
+    if (!password) missingFields.push('password');
+    if (!fullName) missingFields.push('fullName');
+    if (!regNumber) missingFields.push('regNumber');
+
+    if (missingFields.length > 0) {
+      return res.status(400).json({
+        error: `Missing required registration fields: ${missingFields.join(', ')}.`,
+      });
     }
 
     if (!hasAtLeastTwoNames(fullName)) {
@@ -304,36 +340,6 @@ router.post('/auth/register', async (req, res) => {
       return res.status(409).json({
         error: 'This registration number is already in the database.',
       });
-    }
-
-    const { data: otpChallenge, error: otpError } = await adminClient
-      .from('email_otp_challenges')
-      .select('*')
-      .eq('id', challengeId)
-      .eq('email', email)
-      .eq('purpose', 'registration')
-      .maybeSingle();
-
-    if (otpError) {
-      throw otpError;
-    }
-
-    if (!otpChallenge) {
-      return res.status(404).json({ error: 'OTP challenge not found.' });
-    }
-
-    const expectedHash = hashOtp({
-      challengeId,
-      email,
-      purpose: 'registration',
-      code: otpCode,
-    });
-
-    if (
-      otpChallenge.verified_at == null ||
-      otpChallenge.otp_hash !== expectedHash
-    ) {
-      return res.status(401).json({ error: 'OTP must be verified before registration.' });
     }
 
     const { data, error } = await adminClient.auth.admin.createUser({
@@ -391,7 +397,7 @@ router.post('/auth/register', async (req, res) => {
 
 router.post('/auth/login', async (req, res) => {
   try {
-    const emailOrReg = String(req.body.email || req.body.identifier || '').trim();
+    const emailOrReg = String(req.body.email || req.body.identifier || req.body.username || '').trim();
     const password = String(req.body.password || '');
 
     if (!emailOrReg || !password) {
@@ -419,25 +425,10 @@ router.post('/auth/login', async (req, res) => {
       throw profileError;
     }
 
-    const { challengeId, expiresInMinutes } = await createOtpChallenge({
-      email: loginEmail,
-      purpose: 'login',
-      req,
-    });
-
-    pendingLoginChallenges.set(challengeId, {
-      accessToken: signInData.session.access_token,
-      refreshToken: signInData.session.refresh_token,
-      profile: mapProfileRow(profileRow),
-      createdAt: Date.now(),
-    });
-
     return res.status(200).json({
-      requiresOtp: true,
-      challengeId,
-      email: loginEmail,
-      expiresInMinutes,
-      message: 'We sent a login verification code to your email.',
+      token: signInData.session.access_token,
+      refreshToken: signInData.session.refresh_token,
+      user: mapProfileRow(profileRow),
     });
   } catch (error) {
     return res.status(Number(error?.statusCode || 500)).json({
