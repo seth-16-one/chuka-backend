@@ -4,6 +4,23 @@ function getProvider() {
   return String(process.env.EMAIL_PROVIDER || 'smtp').trim().toLowerCase();
 }
 
+function hasProductionMailerConfig(provider) {
+  if (provider === 'resend') {
+    return Boolean(process.env.RESEND_API_KEY);
+  }
+
+  if (provider === 'sendgrid') {
+    return Boolean(process.env.SENDGRID_API_KEY);
+  }
+
+  return Boolean(
+    process.env.SMTP_HOST &&
+    process.env.SMTP_PORT &&
+    process.env.SMTP_USER &&
+    process.env.SMTP_PASS
+  );
+}
+
 function getEmailContent({ code, expiresInMinutes }) {
   return {
     subject: 'Your Chuka University verification code',
@@ -120,6 +137,23 @@ async function sendViaSendGrid({ email, code, expiresInMinutes }) {
 async function sendOtpEmail({ email, code, expiresInMinutes }) {
   const provider = getProvider();
 
+  if (provider === 'console') {
+    console.log(`[OTP:${expiresInMinutes}m] ${email} -> ${code}`);
+    return;
+  }
+
+  if (!hasProductionMailerConfig(provider)) {
+    if (String(process.env.NODE_ENV || '').trim().toLowerCase() !== 'production') {
+      console.warn(
+        `OTP mailer config incomplete for provider "${provider}". Falling back to console delivery in development.`
+      );
+      console.log(`[OTP:${expiresInMinutes}m] ${email} -> ${code}`);
+      return;
+    }
+
+    throw new Error(`Missing mailer configuration for provider "${provider}".`);
+  }
+
   if (provider === 'resend') {
     return sendViaResend({ email, code, expiresInMinutes });
   }
@@ -128,7 +162,17 @@ async function sendOtpEmail({ email, code, expiresInMinutes }) {
     return sendViaSendGrid({ email, code, expiresInMinutes });
   }
 
-  return sendViaSmtp({ email, code, expiresInMinutes });
+  try {
+    return sendViaSmtp({ email, code, expiresInMinutes });
+  } catch (error) {
+    if (String(process.env.NODE_ENV || '').trim().toLowerCase() !== 'production') {
+      console.warn(`SMTP OTP send failed, falling back to console delivery: ${error.message}`);
+      console.log(`[OTP:${expiresInMinutes}m] ${email} -> ${code}`);
+      return;
+    }
+
+    throw error;
+  }
 }
 
 module.exports = {
