@@ -2,6 +2,13 @@ const express = require('express');
 const crypto = require('crypto');
 
 const { adminClient, publicClient } = require('../lib/supabase');
+const { signSessionToken } = require('../lib/session-token');
+const {
+  findUserRow,
+  hashLegacyPassword,
+  mapLegacyAccountToProfile,
+  verifyLegacyPassword,
+} = require('../lib/legacy-auth');
 const { sendOtpEmail } = require('../lib/mailer');
 const {
   OTP_EXPIRY_MINUTES,
@@ -31,6 +38,248 @@ function mapProfileRow(row) {
     phone: row.phone,
     bio: row.bio,
     avatarUrl: row.avatar_url,
+  };
+}
+
+function issueAuthTokens(profile, source) {
+  const sessionPayload = {
+    sub: profile.id,
+    email: profile.email,
+    role: profile.role,
+    source,
+    fullName: profile.fullName,
+  };
+
+  return {
+    token: signSessionToken(sessionPayload, 60 * 60 * 24 * 7),
+    refreshToken: signSessionToken({ ...sessionPayload, type: 'refresh' }, 60 * 60 * 24 * 30),
+  };
+}
+
+function isMissingTableError(error) {
+  const message = String(error?.message || '').toLowerCase();
+  return message.includes('relation') && message.includes('does not exist');
+}
+
+async function loadLegacyProfileById(userId) {
+  const sources = [
+    {
+      source: 'users',
+      query: adminClient.from('users').select('*').eq('id', userId).maybeSingle(),
+    },
+    {
+      source: 'registration',
+      query: adminClient.from('registration').select('*').eq('id', userId).maybeSingle(),
+    },
+  ];
+
+  for (const item of sources) {
+    const { data, error } = await item.query;
+    if (error) {
+      if (isMissingTableError(error)) {
+        continue;
+      }
+      throw error;
+    }
+
+    if (!data) {
+      continue;
+    }
+
+    if (item.source === 'registration') {
+      return {
+        id: data.id,
+        fullName: data.full_name || data.username || '',
+        email: data.email,
+        role: data.role || 'student',
+        source: item.source,
+        regNumber: data.username || undefined,
+        phone: data.phone || undefined,
+      };
+    }
+
+    const account = await findUserRow(data.email || data.username || data.id);
+    if (!account) {
+      return mapLegacyAccountToProfile({
+        source: item.source,
+        row: data,
+        extra: {},
+      });
+    }
+
+    const profile = mapLegacyAccountToProfile(account);
+    return profile;
+  }
+
+  const linkedTables = [
+    {
+      table: 'students',
+      select: 'id, user_id, full_name, admission_number, phone, address, profile_picture_url, bio',
+      filter: (query, value) => query.eq('user_id', value),
+      mapper: (row) => ({
+        id: row.user_id || row.id,
+        fullName: row.full_name,
+        email: '',
+        role: 'student',
+        regNumber: row.admission_number,
+        department: row.address,
+        phone: row.phone,
+        bio: row.bio,
+        avatarUrl: row.profile_picture_url,
+        source: 'students',
+      }),
+    },
+    {
+      table: 'teachers',
+      select: 'id, user_id, full_name, teacher_number, subject, phone, profile_picture_url, bio',
+      filter: (query, value) => query.eq('user_id', value),
+      mapper: (row) => ({
+        id: row.user_id || row.id,
+        fullName: row.full_name,
+        email: '',
+        role: 'lecturer',
+        staffNumber: row.teacher_number,
+        department: row.subject,
+        phone: row.phone,
+        bio: row.bio,
+        avatarUrl: row.profile_picture_url,
+        source: 'teachers',
+      }),
+    },
+    {
+      table: 'admins',
+      select: 'id, user_id, full_name, phone, profile_picture_url, bio',
+      filter: (query, value) => query.eq('user_id', value),
+      mapper: (row) => ({
+        id: row.user_id || row.id,
+        fullName: row.full_name,
+        email: '',
+        role: 'admin',
+        phone: row.phone,
+        bio: row.bio,
+        avatarUrl: row.profile_picture_url,
+        source: 'admins',
+      }),
+    },
+  ];
+
+  for (const item of linkedTables) {
+    const { data, error } = await adminClient.from(item.table).select(item.select).eq('user_id', userId).maybeSingle();
+    if (error) {
+      if (isMissingTableError(error)) {
+        continue;
+      }
+      throw error;
+    }
+
+    if (data) {
+      return item.mapper(data);
+    }
+  }
+
+  return null;
+}
+
+async function loadProfileByAuthUser(user) {
+  if (user?.source === 'profiles') {
+    const { data, error } = await adminClient
+      .from('profiles')
+      .select('*')
+      .eq('id', user.id)
+      .maybeSingle();
+
+    if (error) {
+      if (!isMissingTableError(error)) {
+        throw error;
+      }
+    }
+
+    if (data) {
+      return mapProfileRow(data);
+    }
+  }
+
+  const legacyProfile = await loadLegacyProfileById(user.id);
+  if (legacyProfile) {
+    return legacyProfile;
+  }
+
+  const { data, error } = await adminClient
+    .from('profiles')
+    .select('*')
+    .eq('id', user.id)
+    .maybeSingle();
+
+  if (error) {
+    if (!isMissingTableError(error)) {
+      throw error;
+    }
+  }
+
+  if (data) {
+    return mapProfileRow(data);
+  }
+
+  return null;
+}
+
+async function attemptModernLogin(identifier, password) {
+  const loginEmail = await resolveLoginEmail(identifier);
+  const { data: signInData, error: signInError } = await publicClient.auth.signInWithPassword({
+    email: loginEmail,
+    password,
+  });
+
+  if (signInError || !signInData.user || !signInData.session) {
+    return null;
+  }
+
+  const { data: profileRow, error: profileError } = await adminClient
+    .from('profiles')
+    .select('*')
+    .eq('id', signInData.user.id)
+    .maybeSingle();
+
+  if (profileError) {
+    if (!isMissingTableError(profileError)) {
+      throw profileError;
+    }
+    return null;
+  }
+
+  if (!profileRow) {
+    return null;
+  }
+
+  return {
+    profile: mapProfileRow(profileRow),
+    source: 'profiles',
+  };
+}
+
+async function attemptLegacyLogin(identifier, password) {
+  const account = await findUserRow(identifier);
+  if (!account?.row) {
+    return null;
+  }
+
+  const passwordHash = account.row.password_hash || account.row.passwordHash;
+  const validPassword = await verifyLegacyPassword(password, passwordHash);
+  if (!validPassword) {
+    return null;
+  }
+
+  if (account.row.is_active === false || account.row.is_suspended === true) {
+    const error = new Error('This account is disabled.');
+    error.statusCode = 403;
+    throw error;
+  }
+
+  const profile = mapLegacyAccountToProfile(account);
+
+  return {
+    profile,
+    source: account.source,
   };
 }
 
@@ -96,6 +345,7 @@ async function createOtpChallenge({ email, purpose, req }) {
 
   return {
     challengeId,
+    code,
     expiresInMinutes: OTP_EXPIRY_MINUTES,
   };
 }
@@ -234,14 +484,20 @@ router.post('/otp/request', async (req, res) => {
       return res.status(400).json({ error: 'Email is required.' });
     }
 
-    const { challengeId, expiresInMinutes } = await createOtpChallenge({ email, purpose, req });
+    const { challengeId, code, expiresInMinutes } = await createOtpChallenge({ email, purpose, req });
 
-    return res.status(200).json({
+    const response = {
       success: true,
       challengeId,
       expiresInMinutes,
       message: 'OTP sent successfully.',
-    });
+    };
+
+    if (process.env.NODE_ENV !== 'production') {
+      response.otpCode = code;
+    }
+
+    return res.status(200).json(response);
   } catch (error) {
     const statusCode = Number(error?.statusCode || 500);
     const message =
@@ -288,12 +544,16 @@ router.post('/auth/register', async (req, res) => {
     const fullName = String(req.body.fullName || '').trim();
     const regNumber = String(req.body.regNumber || '').trim();
     const department = String(req.body.department || '').trim();
+    const challengeId = String(req.body.challengeId || '').trim();
+    const otpCode = String(req.body.otpCode || '').trim();
     const missingFields = [];
 
     if (!email) missingFields.push('email');
     if (!password) missingFields.push('password');
     if (!fullName) missingFields.push('fullName');
     if (!regNumber) missingFields.push('regNumber');
+    if (!challengeId) missingFields.push('challengeId');
+    if (!otpCode) missingFields.push('otpCode');
 
     if (missingFields.length > 0) {
       return res.status(400).json({
@@ -319,6 +579,13 @@ router.post('/auth/register', async (req, res) => {
           'Password must be more than 8 characters, include an uppercase letter, a number, a special character, and must not include your names.',
       });
     }
+
+    await verifyOtpChallenge({
+      email,
+      challengeId,
+      code: otpCode,
+      purpose: 'registration',
+    });
 
     const { data: existingProfile, error: existingProfileError } = await adminClient
       .from('profiles')
@@ -404,32 +671,48 @@ router.post('/auth/login', async (req, res) => {
       return res.status(400).json({ error: 'Email or registration number and password are required.' });
     }
 
-    const loginEmail = await resolveLoginEmail(emailOrReg);
+    let modernLogin = null;
+    let modernLoginError = null;
 
-    const { data: signInData, error: signInError } = await publicClient.auth.signInWithPassword({
-      email: loginEmail,
-      password,
-    });
-
-    if (signInError || !signInData.user || !signInData.session) {
-      return res.status(401).json({ error: signInError?.message || 'Invalid login details.' });
+    try {
+      modernLogin = await attemptModernLogin(emailOrReg, password);
+    } catch (error) {
+      modernLoginError = error;
     }
 
-    const { data: profileRow, error: profileError } = await adminClient
-      .from('profiles')
-      .select('*')
-      .eq('id', signInData.user.id)
-      .single();
-
-    if (profileError) {
-      throw profileError;
+    if (modernLogin) {
+      const tokens = issueAuthTokens(modernLogin.profile, modernLogin.source);
+      return res.status(200).json({
+        ...tokens,
+        user: modernLogin.profile,
+      });
     }
 
-    return res.status(200).json({
-      token: signInData.session.access_token,
-      refreshToken: signInData.session.refresh_token,
-      user: mapProfileRow(profileRow),
-    });
+    let legacyLogin = null;
+    try {
+      legacyLogin = await attemptLegacyLogin(emailOrReg, password);
+    } catch (error) {
+      if (!modernLoginError) {
+        modernLoginError = error;
+      }
+    }
+
+    if (legacyLogin) {
+      const tokens = issueAuthTokens(legacyLogin.profile, legacyLogin.source);
+      return res.status(200).json({
+        ...tokens,
+        user: legacyLogin.profile,
+      });
+    }
+
+    if (modernLoginError && !isMissingTableError(modernLoginError)) {
+      const modernMessage = String(modernLoginError?.message || '');
+      if (modernMessage && !/invalid|not found|relation|does not exist/i.test(modernMessage)) {
+        throw modernLoginError;
+      }
+    }
+
+    return res.status(401).json({ error: 'Invalid login details.' });
   } catch (error) {
     return res.status(Number(error?.statusCode || 500)).json({
       error: error instanceof Error ? error.message : 'Login failed.',
@@ -486,7 +769,20 @@ router.post('/auth/password-reset/request', async (req, res) => {
       });
     }
 
-    const email = await resolveLoginEmail(identifier);
+    let email = null;
+    try {
+      email = await resolveLoginEmail(identifier);
+    } catch {
+      const legacyAccount = await findUserRow(identifier);
+      email = legacyAccount?.row?.email || null;
+    }
+
+    if (!email) {
+      return res.status(404).json({
+        error: 'No account found for that email, username, or registration number.',
+      });
+    }
+
     const { challengeId, expiresInMinutes } = await createOtpChallenge({
       email,
       purpose: 'password_reset',
@@ -550,12 +846,27 @@ router.post('/auth/password-reset/confirm', async (req, res) => {
       purpose: 'password_reset',
     });
 
-    const { error: updateError } = await adminClient.auth.admin.updateUserById(profile.id, {
-      password: newPassword,
-    });
+    const legacyAccount = await findUserRow(email);
+    if (legacyAccount?.row?.password_hash !== undefined) {
+      const hashedPassword = await hashLegacyPassword(newPassword);
+      const legacyTable = legacyAccount.source === 'registration' ? 'registration' : 'users';
 
-    if (updateError) {
-      throw updateError;
+      const { error: legacyUpdateError } = await adminClient
+        .from(legacyTable)
+        .update({ password_hash: hashedPassword })
+        .eq('id', legacyAccount.row.id);
+
+      if (legacyUpdateError) {
+        throw legacyUpdateError;
+      }
+    } else {
+      const { error: updateError } = await adminClient.auth.admin.updateUserById(profile.id, {
+        password: newPassword,
+      });
+
+      if (updateError) {
+        throw updateError;
+      }
     }
 
     return res.status(200).json({
@@ -571,19 +882,14 @@ router.post('/auth/password-reset/confirm', async (req, res) => {
 
 router.get('/auth/me', requireAuth, async (req, res) => {
   try {
-    const { data, error } = await adminClient
-      .from('profiles')
-      .select('*')
-      .eq('id', req.user.id)
-      .single();
-
-    if (error) {
-      throw error;
+    const profile = await loadProfileByAuthUser(req.user);
+    if (profile) {
+      return res.status(200).json({
+        user: profile,
+      });
     }
 
-    return res.status(200).json({
-      user: mapProfileRow(data),
-    });
+    return res.status(404).json({ error: 'Profile not found.' });
   } catch (error) {
     return res.status(500).json({
       error: error instanceof Error ? error.message : 'Failed to load profile.',
