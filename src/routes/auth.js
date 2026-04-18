@@ -62,6 +62,62 @@ function isMissingTableError(error) {
   return message.includes('relation') && message.includes('does not exist');
 }
 
+function buildLoginUsername(email, regNumber, fullName) {
+  const regValue = String(regNumber || '').trim();
+  if (regValue) {
+    return regValue;
+  }
+
+  const nameValue = String(fullName || '').trim().toLowerCase().replace(/\s+/g, '.').replace(/[^a-z0-9._-]/g, '');
+  if (nameValue) {
+    return nameValue;
+  }
+
+  return String(email || '')
+    .trim()
+    .toLowerCase()
+    .split('@')[0] || 'student';
+}
+
+async function syncUsersAccount({
+  id,
+  email,
+  password,
+  fullName,
+  regNumber,
+  role = 'student',
+  department,
+  passwordResetRequired = false,
+}) {
+  const passwordHash = await hashLegacyPassword(password);
+  const username = buildLoginUsername(email, regNumber, fullName);
+
+  const { error } = await adminClient.from('users').upsert(
+    {
+      id,
+      username,
+      email,
+      password_hash: passwordHash,
+      role,
+      reg_number: regNumber || null,
+      is_active: true,
+      is_suspended: false,
+      password_reset_required: passwordResetRequired,
+    },
+    { onConflict: 'id' }
+  );
+
+  if (error) {
+    throw error;
+  }
+
+  return {
+    username,
+    passwordHash,
+    department,
+  };
+}
+
 async function loadLegacyProfileById(userId) {
   const sources = [
     {
@@ -768,6 +824,28 @@ router.post('/auth/register', async (req, res) => {
       });
     }
 
+    const { data: existingUser, error: existingUserError } = await adminClient
+      .from('users')
+      .select('id, email, reg_number')
+      .or(`email.eq.${email},reg_number.eq.${regNumber}`)
+      .maybeSingle();
+
+    if (existingUserError) {
+      throw existingUserError;
+    }
+
+    if (existingUser?.email === email) {
+      return res.status(409).json({
+        error: 'An account with this email already exists.',
+      });
+    }
+
+    if (existingUser?.reg_number === regNumber) {
+      return res.status(409).json({
+        error: 'This registration number is already in the database.',
+      });
+    }
+
     const { data, error } = await adminClient.auth.admin.createUser({
       email,
       password,
@@ -788,6 +866,17 @@ router.post('/auth/register', async (req, res) => {
       }
       throw error;
     }
+
+    await syncUsersAccount({
+      id: data.user.id,
+      email,
+      password,
+      fullName,
+      regNumber,
+      role: 'student',
+      department,
+      passwordResetRequired: false,
+    });
 
     await adminClient
       .from('profiles')
@@ -1021,7 +1110,7 @@ router.post('/auth/password-reset/confirm', async (req, res) => {
 
     const { data: profile, error: profileError } = await adminClient
       .from('profiles')
-      .select('id, full_name, email')
+      .select('id, full_name, email, reg_number')
       .eq('email', email)
       .maybeSingle();
 
@@ -1050,6 +1139,7 @@ router.post('/auth/password-reset/confirm', async (req, res) => {
     });
 
     const legacyAccount = await findUserRow(email);
+    const regNumber = legacyAccount?.row?.reg_number || legacyAccount?.row?.username || profile.reg_number || '';
     if (legacyAccount?.row?.password_hash !== undefined) {
       const hashedPassword = await hashLegacyPassword(newPassword);
       const legacyTable = legacyAccount.source === 'registration' ? 'registration' : 'users';
@@ -1062,23 +1152,24 @@ router.post('/auth/password-reset/confirm', async (req, res) => {
       if (legacyUpdateError) {
         throw legacyUpdateError;
       }
-    } else {
-      const { error: updateError } = await adminClient.auth.admin.updateUserById(profile.id, {
-        password: newPassword,
-      });
-
-      if (updateError) {
-        throw updateError;
-      }
     }
 
-    const { error: resetFlagError } = await adminClient
-      .from('users')
-      .update({ password_reset_required: false })
-      .eq('email', email);
+    await syncUsersAccount({
+      id: profile.id,
+      email,
+      password: newPassword,
+      fullName: profile.full_name,
+      regNumber,
+      role: 'student',
+      passwordResetRequired: false,
+    });
 
-    if (resetFlagError) {
-      throw resetFlagError;
+    const { error: updateError } = await adminClient.auth.admin.updateUserById(profile.id, {
+      password: newPassword,
+    });
+
+    if (updateError) {
+      throw updateError;
     }
 
     return res.status(200).json({
