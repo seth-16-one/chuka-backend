@@ -6,6 +6,7 @@ const { signSessionToken } = require('../lib/session-token');
 const {
   findUserRow,
   hashLegacyPassword,
+  isBcryptPasswordHash,
   mapLegacyAccountToProfile,
   verifyLegacyPassword,
 } = require('../lib/legacy-auth');
@@ -395,7 +396,24 @@ async function attemptDirectUserLogin(identifier, password) {
     return null;
   }
 
+  if (userRow.password_reset_required === true) {
+    const resetRequiredError = new Error('This account needs a password reset before login.');
+    resetRequiredError.statusCode = 403;
+    throw resetRequiredError;
+  }
+
   const passwordHash = userRow.password_hash || userRow.passwordHash;
+  if (passwordHash && !isBcryptPasswordHash(passwordHash)) {
+    await adminClient
+      .from('users')
+      .update({ password_reset_required: true })
+      .eq('id', userRow.id);
+
+    const resetError = new Error('This account needs a password reset before login.');
+    resetError.statusCode = 403;
+    throw resetError;
+  }
+
   const validPassword = await verifyLegacyPassword(password, passwordHash);
   if (!validPassword) {
     return null;
@@ -1052,6 +1070,15 @@ router.post('/auth/password-reset/confirm', async (req, res) => {
       if (updateError) {
         throw updateError;
       }
+    }
+
+    const { error: resetFlagError } = await adminClient
+      .from('users')
+      .update({ password_reset_required: false })
+      .eq('email', email);
+
+    if (resetFlagError) {
+      throw resetFlagError;
     }
 
     return res.status(200).json({

@@ -19,6 +19,10 @@ function isOptionalSchemaError(error) {
   );
 }
 
+function isBcryptPasswordHash(value) {
+  return /^\$2[aby]\$\d{2}\$[./A-Za-z0-9]{53}$/.test(String(value || '').trim());
+}
+
 function mapLegacyProfile(userRow, extra = {}) {
   return {
     id: userRow.id,
@@ -242,7 +246,7 @@ async function verifyLegacyPassword(password, passwordHash) {
     return false;
   }
 
-  if (rawHash.startsWith('$2a$') || rawHash.startsWith('$2b$') || rawHash.startsWith('$2y$')) {
+  if (isBcryptPasswordHash(rawHash)) {
     return bcrypt.compare(password, rawHash);
   }
 
@@ -274,5 +278,6 @@ module.exports = {
   findUserRow,
   hashLegacyPassword,
   mapLegacyAccountToProfile,
+  isBcryptPasswordHash,
   verifyLegacyPassword,
 };
