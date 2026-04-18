@@ -40,9 +40,10 @@ function getEmailContent({ code, expiresInMinutes }) {
 
 function createSmtpTransporter() {
   return nodemailer.createTransport({
-    host: process.env.SMTP_HOST,
-    port: Number(process.env.SMTP_PORT || 465),
-    secure: String(process.env.SMTP_SECURE || 'true') === 'true',
+    host: process.env.SMTP_HOST || 'smtp.gmail.com',
+    port: Number(process.env.SMTP_PORT || 587),
+    secure: String(process.env.SMTP_SECURE || 'false') === 'true',
+    requireTLS: true,
     auth: {
       user: process.env.SMTP_USER,
       pass: process.env.SMTP_PASS,
@@ -50,19 +51,22 @@ function createSmtpTransporter() {
     tls: {
       minVersion: 'TLSv1.2',
     },
+    connectionTimeout: 10000,
+    greetingTimeout: 10000,
+    socketTimeout: 10000,
   });
 }
 
 async function sendViaSmtp({ email, code, expiresInMinutes }) {
   const transporter = createSmtpTransporter();
   const smtpUser = process.env.SMTP_USER;
-  const brandedReplyTo = process.env.EMAIL_FROM_ADDRESS || smtpUser;
   const fromName = process.env.EMAIL_FROM_NAME || 'Chuka University App';
+  const fromEmail = smtpUser;
   const content = getEmailContent({ code, expiresInMinutes });
 
   await transporter.sendMail({
-    from: `"${fromName}" <${smtpUser}>`,
-    replyTo: brandedReplyTo,
+    from: `"${fromName}" <${fromEmail}>`,
+    replyTo: fromEmail,
     to: email,
     subject: content.subject,
     text: content.text,

@@ -283,6 +283,146 @@ async function attemptLegacyLogin(identifier, password) {
   };
 }
 
+async function authenticateLogin(identifier, password) {
+  let modernLogin = null;
+  let modernLoginError = null;
+
+  try {
+    modernLogin = await attemptModernLogin(identifier, password);
+  } catch (error) {
+    modernLoginError = error;
+  }
+
+  if (modernLogin) {
+    return modernLogin;
+  }
+
+  let legacyLogin = null;
+  try {
+    legacyLogin = await attemptLegacyLogin(identifier, password);
+  } catch (error) {
+    if (!modernLoginError) {
+      modernLoginError = error;
+    }
+  }
+
+  if (legacyLogin) {
+    return legacyLogin;
+  }
+
+  if (modernLoginError && !isMissingTableError(modernLoginError)) {
+    const modernMessage = String(modernLoginError?.message || '');
+    if (modernMessage && !/invalid|not found|relation|does not exist/i.test(modernMessage)) {
+      throw modernLoginError;
+    }
+  }
+
+  return null;
+}
+
+function maskEmail(email) {
+  const normalized = normalizeEmail(email);
+  const atIndex = normalized.indexOf('@');
+  if (atIndex <= 1) {
+    return normalized;
+  }
+
+  const name = normalized.slice(0, atIndex);
+  const domain = normalized.slice(atIndex);
+  return `${name.slice(0, 2)}***${domain}`;
+}
+
+async function handlePasswordLogin(req, res) {
+  try {
+    const emailOrReg = String(req.body.email || req.body.identifier || req.body.username || '').trim();
+    const password = String(req.body.password || '');
+
+    if (!emailOrReg || !password) {
+      return res.status(400).json({ error: 'Email, username, or registration number and password are required.' });
+    }
+
+    const login = await attemptDirectUserLogin(emailOrReg, password);
+
+    if (!login) {
+      return res.status(401).json({ error: 'Invalid login details.' });
+    }
+
+    const tokens = issueAuthTokens(login.profile, login.source);
+    return res.status(200).json({
+      ...tokens,
+      user: login.profile,
+    });
+  } catch (error) {
+    return res.status(Number(error?.statusCode || 500)).json({
+      error: error instanceof Error ? error.message : 'Login failed.',
+    });
+  }
+}
+
+async function attemptDirectUserLogin(identifier, password) {
+  const normalized = String(identifier || '').trim();
+  const normalizedEmail = normalizeEmail(normalized);
+  const normalizedLower = normalized.toLowerCase();
+  const filters = [];
+
+  if (normalizedEmail) {
+    filters.push(`email.eq.${normalizedEmail}`);
+  }
+
+  if (normalized) {
+    filters.push(`username.eq.${normalized}`);
+    filters.push(`reg_number.eq.${normalized}`);
+    if (normalizedLower && normalizedLower !== normalized) {
+      filters.push(`username.ilike.${normalized}`);
+      filters.push(`reg_number.ilike.${normalized}`);
+    }
+  }
+
+  const { data: userRow, error } = await adminClient
+    .from('users')
+    .select('*')
+    .or(filters.join(','))
+    .maybeSingle();
+
+  if (error) {
+    if (isMissingTableError(error)) {
+      return null;
+    }
+    throw error;
+  }
+
+  if (!userRow) {
+    return null;
+  }
+
+  const passwordHash = userRow.password_hash || userRow.passwordHash;
+  const validPassword = await verifyLegacyPassword(password, passwordHash);
+  if (!validPassword) {
+    return null;
+  }
+
+  if (userRow.is_active === false || userRow.is_suspended === true) {
+    const disabledError = new Error('This account is disabled.');
+    disabledError.statusCode = 403;
+    throw disabledError;
+  }
+
+  return {
+    profile: mapLegacyAccountToProfile({
+      source: 'users',
+      row: userRow,
+      extra: {
+        fullName: userRow.full_name || userRow.username,
+        regNumber: userRow.reg_number,
+        phone: userRow.phone,
+        bio: userRow.bio,
+        avatarUrl: userRow.avatar_url,
+      },
+    }),
+    source: 'users',
+  };
+}
+
 function hasAtLeastTwoNames(value) {
   return String(value || '')
     .trim()
@@ -499,6 +639,7 @@ router.post('/otp/request', async (req, res) => {
 
     return res.status(200).json(response);
   } catch (error) {
+    console.error('OTP Request Error:', error);
     const statusCode = Number(error?.statusCode || 500);
     const message =
       error instanceof Error &&
@@ -662,73 +803,77 @@ router.post('/auth/register', async (req, res) => {
   }
 });
 
-router.post('/auth/login', async (req, res) => {
+router.post('/login', handlePasswordLogin);
+router.post('/auth/login', handlePasswordLogin);
+
+router.post('/login-otp/request', async (req, res) => {
   try {
-    const emailOrReg = String(req.body.email || req.body.identifier || req.body.username || '').trim();
+    const usernameOrEmail = String(req.body.usernameOrEmail || req.body.username || req.body.email || '').trim();
     const password = String(req.body.password || '');
+    const expectedRole = String(req.body.expectedRole || '').trim().toLowerCase();
+    const channel = String(req.body.channel || 'email').trim().toLowerCase() || 'email';
 
-    if (!emailOrReg || !password) {
-      return res.status(400).json({ error: 'Email or registration number and password are required.' });
-    }
-
-    let modernLogin = null;
-    let modernLoginError = null;
-
-    try {
-      modernLogin = await attemptModernLogin(emailOrReg, password);
-    } catch (error) {
-      modernLoginError = error;
-    }
-
-    if (modernLogin) {
-      const tokens = issueAuthTokens(modernLogin.profile, modernLogin.source);
-      return res.status(200).json({
-        ...tokens,
-        user: modernLogin.profile,
+    if (!usernameOrEmail || !password) {
+      return res.status(400).json({
+        error: 'Username/email and password are required.',
       });
     }
 
-    let legacyLogin = null;
-    try {
-      legacyLogin = await attemptLegacyLogin(emailOrReg, password);
-    } catch (error) {
-      if (!modernLoginError) {
-        modernLoginError = error;
-      }
+    const login = await authenticateLogin(usernameOrEmail, password);
+    if (!login) {
+      return res.status(401).json({ error: 'Invalid login details.' });
     }
 
-    if (legacyLogin) {
-      const tokens = issueAuthTokens(legacyLogin.profile, legacyLogin.source);
-      return res.status(200).json({
-        ...tokens,
-        user: legacyLogin.profile,
-      });
+    if (expectedRole && login.profile?.role && String(login.profile.role).toLowerCase() !== expectedRole) {
+      return res.status(403).json({ error: `This app accepts ${expectedRole} accounts only.` });
     }
 
-    if (modernLoginError && !isMissingTableError(modernLoginError)) {
-      const modernMessage = String(modernLoginError?.message || '');
-      if (modernMessage && !/invalid|not found|relation|does not exist/i.test(modernMessage)) {
-        throw modernLoginError;
-      }
+    const email = normalizeEmail(login.profile.email);
+    const { challengeId, code, expiresInMinutes } = await createOtpChallenge({ email, purpose: 'login', req });
+    const tokens = issueAuthTokens(login.profile, login.source);
+
+    pendingLoginChallenges.set(challengeId, {
+      email,
+      profile: login.profile,
+      source: login.source,
+      accessToken: tokens.token,
+      refreshToken: tokens.refreshToken,
+      createdAt: new Date().toISOString(),
+      channel,
+    });
+
+    const response = {
+      success: true,
+      challengeId,
+      email,
+      channel,
+      availableChannels: [channel],
+      destinationMasked: maskEmail(email),
+      expiresInMinutes,
+      message: 'We sent a login verification code to your email.',
+    };
+
+    if (process.env.NODE_ENV !== 'production') {
+      response.otpCode = code;
     }
 
-    return res.status(401).json({ error: 'Invalid login details.' });
+    return res.status(200).json(response);
   } catch (error) {
+    console.error('Login OTP Request Error:', error);
     return res.status(Number(error?.statusCode || 500)).json({
-      error: error instanceof Error ? error.message : 'Login failed.',
+      error: error instanceof Error ? error.message : 'Failed to request login OTP.',
     });
   }
 });
 
-router.post('/auth/login/verify', async (req, res) => {
+router.post('/login-otp/verify', async (req, res) => {
   try {
-    const email = normalizeEmail(req.body.email);
     const challengeId = String(req.body.challengeId || '').trim();
-    const otpCode = String(req.body.otpCode || '').trim();
+    const code = String(req.body.code || '').trim();
 
-    if (!email || !challengeId || !otpCode) {
+    if (!challengeId || !code) {
       return res.status(400).json({
-        error: 'Email, challengeId, and otpCode are required.',
+        error: 'challengeId and code are required.',
       });
     }
 
@@ -740,7 +885,47 @@ router.post('/auth/login/verify', async (req, res) => {
     }
 
     await verifyOtpChallenge({
-      email,
+      email: pendingLogin.email,
+      challengeId,
+      code,
+      purpose: 'login',
+    });
+
+    pendingLoginChallenges.delete(challengeId);
+
+    return res.status(200).json({
+      token: pendingLogin.accessToken,
+      refreshToken: pendingLogin.refreshToken,
+      user: pendingLogin.profile,
+    });
+  } catch (error) {
+    console.error('Login OTP Verify Error:', error);
+    return res.status(Number(error?.statusCode || 500)).json({
+      error: error instanceof Error ? error.message : 'Failed to verify login OTP.',
+    });
+  }
+});
+
+router.post('/auth/login/verify', async (req, res) => {
+  try {
+    const challengeId = String(req.body.challengeId || '').trim();
+    const otpCode = String(req.body.otpCode || req.body.code || '').trim();
+
+    if (!challengeId || !otpCode) {
+      return res.status(400).json({
+        error: 'challengeId and otpCode are required.',
+      });
+    }
+
+    const pendingLogin = pendingLoginChallenges.get(challengeId);
+    if (!pendingLogin) {
+      return res.status(410).json({
+        error: 'This login request has expired. Please sign in again.',
+      });
+    }
+
+    await verifyOtpChallenge({
+      email: pendingLogin.email,
       challengeId,
       code: otpCode,
       purpose: 'login',
