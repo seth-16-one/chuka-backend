@@ -242,10 +242,6 @@ async function verifyLegacyPassword(password, passwordHash) {
     return false;
   }
 
-  if (rawHash === password) {
-    return true;
-  }
-
   if (rawHash.startsWith('$2a$') || rawHash.startsWith('$2b$') || rawHash.startsWith('$2y$')) {
     return bcrypt.compare(password, rawHash);
   }
