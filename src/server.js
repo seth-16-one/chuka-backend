@@ -37,6 +37,6 @@ app.use((err, _req, res, _next) => {
   });
 });
 
-app.listen(port, () => {
+app.listen(port, '0.0.0.0', () => {
   console.log(`Chuka backend listening on port ${port}`);
 });

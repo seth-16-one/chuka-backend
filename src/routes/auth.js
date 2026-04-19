@@ -555,6 +555,7 @@ async function createOtpChallenge({ email, purpose, req }) {
     email,
     code,
     expiresInMinutes: OTP_EXPIRY_MINUTES,
+    purpose,
   });
 
   return {
@@ -802,26 +803,30 @@ router.post('/auth/register', async (req, res) => {
       purpose: 'registration',
     });
 
-    const { data: existingProfile, error: existingProfileError } = await adminClient
-      .from('profiles')
-      .select('id, email, reg_number')
-      .or(`email.eq.${email},reg_number.eq.${regNumber}`)
-      .maybeSingle();
+    try {
+      const { data: existingProfile, error: existingProfileError } = await adminClient
+        .from('profiles')
+        .select('id, email, reg_number')
+        .or(`email.eq.${email},reg_number.eq.${regNumber}`)
+        .maybeSingle();
 
-    if (existingProfileError) {
-      throw existingProfileError;
-    }
-
-    if (existingProfile?.email === email) {
-      return res.status(409).json({
-        error: 'An account with this email already exists.',
-      });
-    }
-
-    if (existingProfile?.reg_number === regNumber) {
-      return res.status(409).json({
-        error: 'This registration number is already in the database.',
-      });
+      if (existingProfileError) {
+        if (!isMissingTableError(existingProfileError)) {
+          throw existingProfileError;
+        }
+      } else if (existingProfile?.email === email) {
+        return res.status(409).json({
+          error: 'An account with this email already exists.',
+        });
+      } else if (existingProfile?.reg_number === regNumber) {
+        return res.status(409).json({
+          error: 'This registration number is already in the database.',
+        });
+      }
+    } catch (error) {
+      if (!isMissingTableError(error)) {
+        throw error;
+      }
     }
 
     const { data: existingUser, error: existingUserError } = await adminClient
@@ -878,30 +883,35 @@ router.post('/auth/register', async (req, res) => {
       passwordResetRequired: false,
     });
 
-    await adminClient
-      .from('profiles')
-      .update({
-        full_name: fullName,
-        email,
-        role: 'student',
-        reg_number: regNumber,
-        department,
-      })
-      .eq('id', data.user.id);
+    const profilePayload = {
+      id: data.user.id,
+      fullName,
+      email,
+      role: 'student',
+      regNumber,
+      department,
+    };
 
-    const { data: profileRow, error: profileError } = await adminClient
-      .from('profiles')
-      .select('*')
-      .eq('id', data.user.id)
-      .single();
-
-    if (profileError) {
-      throw profileError;
+    try {
+      await adminClient
+        .from('profiles')
+        .update({
+          full_name: fullName,
+          email,
+          role: 'student',
+          reg_number: regNumber,
+          department,
+        })
+        .eq('id', data.user.id);
+    } catch (error) {
+      if (!isMissingTableError(error)) {
+        throw error;
+      }
     }
 
     return res.status(201).json({
       success: true,
-      user: mapProfileRow(profileRow),
+      user: profilePayload,
     });
   } catch (error) {
     return res.status(500).json({
@@ -1108,20 +1118,41 @@ router.post('/auth/password-reset/confirm', async (req, res) => {
       });
     }
 
-    const { data: profile, error: profileError } = await adminClient
-      .from('profiles')
-      .select('id, full_name, email, reg_number')
-      .eq('email', email)
-      .maybeSingle();
+    let profile = null;
+    try {
+      const { data: profileRow, error: profileError } = await adminClient
+        .from('profiles')
+        .select('id, full_name, email, reg_number')
+        .eq('email', email)
+        .maybeSingle();
 
-    if (profileError) {
-      throw profileError;
+      if (profileError) {
+        if (!isMissingTableError(profileError)) {
+          throw profileError;
+        }
+      } else {
+        profile = profileRow;
+      }
+    } catch (error) {
+      if (!isMissingTableError(error)) {
+        throw error;
+      }
     }
 
     if (!profile) {
-      return res.status(404).json({
-        error: 'No account found for that email address.',
-      });
+      const legacyAccount = await findUserRow(email);
+      if (!legacyAccount?.row) {
+        return res.status(404).json({
+          error: 'No account found for that email address.',
+        });
+      }
+
+      profile = {
+        id: legacyAccount.row.id,
+        full_name: legacyAccount.row.full_name || legacyAccount.row.username || '',
+        email: legacyAccount.row.email,
+        reg_number: legacyAccount.row.reg_number || legacyAccount.row.username || '',
+      };
     }
 
     if (!isStrongPassword(newPassword, profile.full_name)) {
@@ -1164,12 +1195,18 @@ router.post('/auth/password-reset/confirm', async (req, res) => {
       passwordResetRequired: false,
     });
 
-    const { error: updateError } = await adminClient.auth.admin.updateUserById(profile.id, {
-      password: newPassword,
-    });
+    try {
+      const { error: updateError } = await adminClient.auth.admin.updateUserById(profile.id, {
+        password: newPassword,
+      });
 
-    if (updateError) {
-      throw updateError;
+      if (updateError && !/user .* not found|user not found|not found/i.test(updateError.message || '')) {
+        throw updateError;
+      }
+    } catch (authUpdateError) {
+      if (!/user .* not found|user not found|not found/i.test(String(authUpdateError?.message || authUpdateError || ''))) {
+        throw authUpdateError;
+      }
     }
 
     return res.status(200).json({
