@@ -21,6 +21,9 @@ type UserRow = {
   is_active?: boolean | null;
   is_suspended?: boolean | null;
   password_reset_required?: boolean | null;
+  fee_balance_cents?: number | string | null;
+  fees_cleared?: boolean | null;
+  last_payment_at?: string | null;
 };
 
 const CORS_HEADERS = {
@@ -43,8 +46,82 @@ const pendingLoginChallenges = new Map<
     token: string;
     refreshToken: string;
     createdAt: string;
+    sessionId: string;
+    requestIp: string | null;
+    userAgent: string | null;
+    ipLocation: JsonObject | null;
   }
 >();
+
+type SessionRow = {
+  id: string;
+  user_id?: string | null;
+  device_name?: string | null;
+  user_agent?: string | null;
+  ip_address?: string | null;
+  ip_location?: JsonObject | null;
+  created_at?: string | null;
+  last_seen_at?: string | null;
+  revoked_at?: string | null;
+  revoked_reason?: string | null;
+  token_kind?: string | null;
+};
+
+type LoginOtpSessionRow = {
+  id: string;
+  email?: string | null;
+  token?: string | null;
+  refresh_token?: string | null;
+  user_payload?: JsonObject | null;
+  session_id?: string | null;
+  request_ip?: string | null;
+  user_agent?: string | null;
+  ip_location?: JsonObject | null;
+  created_at?: string | null;
+  expires_at?: string | null;
+  consumed_at?: string | null;
+};
+
+type FinanceStatusRow = {
+  user_id?: string | null;
+  balance_cents?: number | string | null;
+  paid_cents?: number | string | null;
+  due_cents?: number | string | null;
+  fees_cleared?: boolean | null;
+  last_payment_at?: string | null;
+  status_label?: string | null;
+  updated_at?: string | null;
+};
+
+type StaffMaterialRow = {
+  id: string;
+  title?: string | null;
+  course_code?: string | null;
+  audience?: string | null;
+  author?: string | null;
+  summary?: string | null;
+  file_label?: string | null;
+  storage_path?: string | null;
+  mime_type?: string | null;
+  original_file_name?: string | null;
+  file_size?: number | string | null;
+  uploaded_by?: string | null;
+  uploaded_at?: string | null;
+  is_published?: boolean | null;
+};
+
+type StudentDocumentRow = {
+  id: string;
+  user_id?: string | null;
+  document_type?: string | null;
+  file_name?: string | null;
+  mime_type?: string | null;
+  storage_path?: string | null;
+  file_size?: number | string | null;
+  fees_cleared?: boolean | null;
+  uploaded_by?: string | null;
+  created_at?: string | null;
+};
 
 function corsResponse(body: JsonObject, status = 200) {
   return new Response(JSON.stringify(body), {
@@ -58,6 +135,10 @@ function corsResponse(body: JsonObject, status = 200) {
 
 function normalizeEmail(value: unknown) {
   return String(value || "").trim().toLowerCase();
+}
+
+function nowIso() {
+  return new Date().toISOString();
 }
 
 function safeJsonParse(text: string) {
@@ -89,6 +170,73 @@ function normalizePath(pathname: string) {
 
 function getEnv(name: string) {
   return String(Deno.env.get(name) || "").trim();
+}
+
+async function storeLoginOtpSession({
+  challengeId,
+  email,
+  user,
+  token,
+  refreshToken,
+  sessionId,
+  requestIp,
+  userAgent,
+  ipLocation,
+}: {
+  challengeId: string;
+  email: string;
+  user: Record<string, unknown>;
+  token: string;
+  refreshToken: string;
+  sessionId: string;
+  requestIp: string | null;
+  userAgent: string | null;
+  ipLocation: JsonObject | null;
+}) {
+  const expiresAt = new Date(Date.now() + OTP_EXPIRY_MINUTES * 60 * 1000).toISOString();
+  const { error } = await adminClient().from("login_otp_sessions").upsert(
+    {
+      id: challengeId,
+      email,
+      token,
+      refresh_token: refreshToken,
+      user_payload: user,
+      session_id: sessionId,
+      request_ip: requestIp,
+      user_agent: userAgent,
+      ip_location: ipLocation,
+      created_at: nowIso(),
+      expires_at: expiresAt,
+      consumed_at: null,
+    },
+    { onConflict: "id" }
+  );
+
+  if (error) {
+    if (isMissingTableError(error)) {
+      return;
+    }
+    throw error;
+  }
+}
+
+async function loadLoginOtpSession(challengeId: string): Promise<LoginOtpSessionRow | null> {
+  const { data, error } = await adminClient().from("login_otp_sessions").select("*").eq("id", challengeId).maybeSingle();
+  if (error) {
+    if (isMissingTableError(error)) {
+      return null;
+    }
+    throw error;
+  }
+
+  return (data as LoginOtpSessionRow | null) ?? null;
+}
+
+async function consumeLoginOtpSession(challengeId: string) {
+  const { error } = await adminClient().from("login_otp_sessions").update({ consumed_at: nowIso() }).eq("id", challengeId);
+  if (error && !isMissingTableError(error)) {
+    throw error;
+  }
 }
 
 function isMissingTableError(error: unknown) {
@@ -201,13 +349,275 @@ function signToken(payload: JsonObject, expiresInSeconds: number) {
   return `${header}.${body}.${signature}`;
 }
 
+function verifyToken(token: string) {
+  const secret = jwtSecret();
+  if (!secret) {
+    throw new Error("Missing JWT_SECRET or OTP_HASH_SECRET.");
+  }
+
+  const parts = String(token || "").split(".");
+  if (parts.length !== 3) {
+    return null;
+  }
+
+  const [header, payload, signature] = parts;
+  const expected = createHmac("sha256", secret)
+    .update(`${header}.${payload}`)
+    .digest("base64")
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/g, "");
+
+  if (expected !== signature) {
+    return null;
+  }
+
+  try {
+    const claims = decodeBase64UrlJson(payload) as JsonObject;
+    if (claims?.exp && Number(claims.exp) < Math.floor(Date.now() / 1000)) {
+      return null;
+    }
+    return claims;
+  } catch {
+    return null;
+  }
+}
+
 function decodeBase64UrlJson(part: string) {
   const normalized = part.replace(/-/g, "+").replace(/_/g, "/");
   const padded = normalized.padEnd(normalized.length + ((4 - (normalized.length % 4)) % 4), "=");
   return JSON.parse(atob(padded));
 }
 
+function getRequestIp(req: Request) {
+  const forwarded = req.headers.get("x-forwarded-for") || req.headers.get("x-real-ip") || "";
+  const candidate = forwarded.split(",")[0]?.trim() || "";
+  return candidate || null;
+}
+
+function getRequestUserAgent(req: Request) {
+  return req.headers.get("user-agent") || null;
+}
+
+function isPrivateIp(ip: string) {
+  return (
+    !ip ||
+    /^127\./.test(ip) ||
+    /^10\./.test(ip) ||
+    /^192\.168\./.test(ip) ||
+    /^169\.254\./.test(ip) ||
+    /^172\.(1[6-9]|2\d|3[0-1])\./.test(ip) ||
+    ip === "::1" ||
+    ip.startsWith("fc") ||
+    ip.startsWith("fd")
+  );
+}
+
+async function lookupIpLocation(ip: string | null): Promise<JsonObject | null> {
+  if (!ip || isPrivateIp(ip)) {
+    return null;
+  }
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 4000);
+
+  try {
+    const response = await fetch(`https://ipapi.co/${encodeURIComponent(ip)}/json/`, {
+      signal: controller.signal,
+    });
+
+    if (!response.ok) {
+      return null;
+    }
+
+    const data = (await response.json().catch(() => ({}))) as JsonObject;
+    return {
+      ip,
+      city: data.city || null,
+      region: data.region || null,
+      country: data.country_name || data.country || null,
+      latitude: data.latitude || null,
+      longitude: data.longitude || null,
+      timezone: data.timezone || null,
+      org: data.org || null,
+    };
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function summarizeLocation(location: JsonObject | null) {
+  if (!location) {
+    return "Unknown location";
+  }
+
+  const parts = [location.city, location.region, location.country].filter(Boolean);
+  return parts.length ? String(parts.join(", ")) : "Unknown location";
+}
+
+async function createSessionContext(req: Request) {
+  const requestIp = getRequestIp(req);
+  const userAgent = getRequestUserAgent(req);
+  const ipLocation = await lookupIpLocation(requestIp);
+  return {
+    requestIp,
+    userAgent,
+    ipLocation,
+  };
+}
+
+async function saveLoginSession({
+  sessionId,
+  userId,
+  tokenKind,
+  req,
+}: {
+  sessionId: string;
+  userId: string;
+  tokenKind: "access" | "refresh";
+  req: Request;
+}) {
+  const { requestIp, userAgent, ipLocation } = await createSessionContext(req);
+  const deviceName = req.headers.get("x-device-name") || userAgent || "Unknown device";
+  const now = nowIso();
+
+  const payload = {
+    id: sessionId,
+    user_id: userId,
+    device_name: deviceName,
+    user_agent: userAgent,
+    ip_address: requestIp,
+    ip_location: ipLocation,
+    ip_city: (ipLocation?.city as string | null) || null,
+    ip_region: (ipLocation?.region as string | null) || null,
+    ip_country: (ipLocation?.country as string | null) || null,
+    token_kind: tokenKind,
+    created_at: now,
+    last_seen_at: now,
+    revoked_at: null,
+    revoked_reason: null,
+  };
+
+  const { error } = await adminClient().from("device_sessions").upsert(payload, { onConflict: "id" });
+  if (error) {
+    if (isMissingTableError(error)) {
+      return;
+    }
+    throw error;
+  }
+}
+
+async function listDeviceSessions(userId: string) {
+  const { data, error } = await adminClient()
+    .from("device_sessions")
+    .select("*")
+    .eq("user_id", userId)
+    .order("created_at", { ascending: false });
+
+  if (error) {
+    if (isMissingTableError(error)) {
+      return [];
+    }
+    throw error;
+  }
+
+  return (data || []) as SessionRow[];
+}
+
+async function revokeDeviceSession(userId: string, sessionId: string, reason: string) {
+  const { error } = await adminClient()
+    .from("device_sessions")
+    .update({ revoked_at: nowIso(), revoked_reason: reason })
+    .eq("id", sessionId)
+    .eq("user_id", userId);
+
+  if (error && !isMissingTableError(error)) {
+    throw error;
+  }
+}
+
+async function revokeOtherDeviceSessions(userId: string, currentSessionId: string) {
+  const { error } = await adminClient()
+    .from("device_sessions")
+    .update({ revoked_at: nowIso(), revoked_reason: "revoked_by_user" })
+    .eq("user_id", userId)
+    .neq("id", currentSessionId);
+
+  if (error && !isMissingTableError(error)) {
+    throw error;
+  }
+}
+
+async function authenticateRequest(req: Request) {
+  const authHeader = req.headers.get("authorization") || "";
+  const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : "";
+
+  if (!token) {
+    const err = new Error("Missing bearer token.");
+    (err as Error & { statusCode?: number }).statusCode = 401;
+    throw err;
+  }
+
+  const claims = verifyToken(token);
+  if (!claims?.sub) {
+    const err = new Error("Invalid or expired token.");
+    (err as Error & { statusCode?: number }).statusCode = 401;
+    throw err;
+  }
+
+  const sessionId = String(claims.sid || claims.session_id || "");
+  if (sessionId) {
+    const { data, error } = await adminClient()
+      .from("device_sessions")
+      .select("*")
+      .eq("id", sessionId)
+      .eq("user_id", String(claims.sub))
+      .maybeSingle();
+
+    if (error && !isMissingTableError(error)) {
+      throw error;
+    }
+
+    if (data && (data as SessionRow).revoked_at) {
+      const err = new Error("This session has been revoked.");
+      (err as Error & { statusCode?: number }).statusCode = 401;
+      throw err;
+    }
+
+    if (data) {
+      await adminClient()
+        .from("device_sessions")
+        .update({ last_seen_at: nowIso() })
+        .eq("id", sessionId)
+        .eq("user_id", String(claims.sub));
+    }
+  }
+
+  return {
+    claims,
+    token,
+    sessionId: sessionId || null,
+  };
+}
+
+async function requireStaffRole(req: Request) {
+  const auth = await authenticateRequest(req);
+  const role = String(auth.claims.role || "student").toLowerCase();
+  if (role !== "lecturer" && role !== "admin") {
+    const err = new Error("Staff access required.");
+    (err as Error & { statusCode?: number }).statusCode = 403;
+    throw err;
+  }
+
+  return auth;
+}
+
 function publicUser(row: UserRow) {
+  const feeBalanceValue = Number(row.fee_balance_cents ?? 0);
+  const feeBalanceCents = Number.isFinite(feeBalanceValue) ? feeBalanceValue : null;
+  const feesCleared = typeof row.fees_cleared === "boolean" ? row.fees_cleared : feeBalanceCents !== null ? feeBalanceCents <= 0 : null;
   return {
     id: row.id,
     username: row.username ?? null,
@@ -220,6 +630,9 @@ function publicUser(row: UserRow) {
     staffNumber: row.staff_number ?? null,
     bio: row.bio ?? null,
     avatarUrl: row.avatar_url ?? null,
+    feeBalanceCents,
+    feesCleared,
+    lastPaymentAt: row.last_payment_at ?? null,
   };
 }
 
@@ -622,11 +1035,29 @@ async function loginHandler(req: Request) {
     }
 
     const user = publicUser(row);
-    const token = signToken({ sub: user.id, email: user.email, role: user.role, source: account.table }, 60 * 60 * 24 * 7);
+    const sessionId = randomUUID();
+    const token = signToken(
+      { sub: user.id, email: user.email, role: user.role, source: account.table, sid: sessionId, token_kind: "access" },
+      60 * 60 * 24 * 7
+    );
     const refreshToken = signToken(
-      { sub: user.id, email: user.email, role: user.role, source: account.table, type: "refresh" },
+      {
+        sub: user.id,
+        email: user.email,
+        role: user.role,
+        source: account.table,
+        sid: sessionId,
+        token_kind: "refresh",
+      },
       60 * 60 * 24 * 30
     );
+
+    await saveLoginSession({
+      sessionId,
+      userId: user.id,
+      tokenKind: "access",
+      req,
+    });
 
     return corsResponse({
       success: true,
@@ -934,20 +1365,9 @@ async function passwordResetConfirmHandler(req: Request) {
 }
 
 async function meHandler(req: Request) {
-  const authHeader = req.headers.get("authorization") || "";
-  const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : "";
-  if (!token) {
-    return corsResponse({ error: "Missing bearer token." }, 401);
-  }
-
   try {
-    const payloadPart = token.split(".")[1];
-    if (!payloadPart) {
-      return corsResponse({ error: "Invalid token." }, 401);
-    }
-
-    const payload = decodeBase64UrlJson(payloadPart);
-    const userId = String(payload.sub || "");
+    const { claims } = await authenticateRequest(req);
+    const userId = String(claims.sub || "");
     if (!userId) {
       return corsResponse({ error: "Invalid token." }, 401);
     }
@@ -973,12 +1393,6 @@ async function meHandler(req: Request) {
 }
 
 async function profileUpdateHandler(req: Request) {
-  const authHeader = req.headers.get("authorization") || "";
-  const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : "";
-  if (!token) {
-    return corsResponse({ error: "Missing bearer token." }, 401);
-  }
-
   const body = await getJsonBody(req);
   const updates = {
     phone: String(body.phone || "").trim() || undefined,
@@ -988,9 +1402,8 @@ async function profileUpdateHandler(req: Request) {
   };
 
   try {
-    const payloadPart = token.split(".")[1];
-    const payload = decodeBase64UrlJson(payloadPart);
-    const userId = String(payload.sub || "");
+    const { claims } = await authenticateRequest(req);
+    const userId = String(claims.sub || "");
     if (!userId) {
       return corsResponse({ error: "Invalid token." }, 401);
     }
@@ -1010,6 +1423,586 @@ async function profileUpdateHandler(req: Request) {
   } catch (error) {
     console.error("profile update error:", error);
     return corsResponse({ error: error instanceof Error ? error.message : "Profile update failed." }, 500);
+  }
+}
+
+function normalizeCents(value: unknown) {
+  if (typeof value === "number") return value;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function mapFinanceStatusRow(row: FinanceStatusRow) {
+  const balanceCents = normalizeCents(row.balance_cents);
+  const paidCents = normalizeCents(row.paid_cents);
+  const dueCents = normalizeCents(row.due_cents);
+  const feesCleared = Boolean(row.fees_cleared ?? balanceCents <= 0);
+
+  return {
+    balanceCents,
+    paidCents,
+    dueCents,
+    feesCleared,
+    lastPaymentAt: row.last_payment_at || null,
+    statusLabel: row.status_label || (feesCleared ? "Cleared" : "Pending"),
+    updatedAt: row.updated_at || null,
+  };
+}
+
+function mapStaffMaterialRow(row: StaffMaterialRow) {
+  return {
+    id: row.id,
+    title: row.title || "Material",
+    courseCode: row.course_code || "",
+    audience: row.audience || "students",
+    author: row.author || "Staff",
+    summary: row.summary || "",
+    fileLabel: row.file_label || "Material",
+    storagePath: row.storage_path || null,
+    mimeType: row.mime_type || null,
+    originalFileName: row.original_file_name || null,
+    fileSize: typeof row.file_size === "number" ? row.file_size : Number(row.file_size || 0) || null,
+    uploadedBy: row.uploaded_by || null,
+    uploadedAt: row.uploaded_at || null,
+    isPublished: row.is_published ?? true,
+  };
+}
+
+function mapStudentDocumentRow(row: StudentDocumentRow) {
+  const fileSizeValue = Number(row.file_size ?? 0);
+  return {
+    id: row.id,
+    userId: row.user_id || null,
+    documentType: row.document_type || null,
+    fileName: row.file_name || null,
+    mimeType: row.mime_type || null,
+    storagePath: row.storage_path || null,
+    fileSize: Number.isFinite(fileSizeValue) ? fileSizeValue : null,
+    feesCleared: typeof row.fees_cleared === "boolean" ? row.fees_cleared : null,
+    uploadedBy: row.uploaded_by || null,
+    createdAt: row.created_at || null,
+  };
+}
+
+function decodeBase64Payload(value: string) {
+  const normalized = String(value || "").replace(/^data:.*;base64,/, "");
+  const binary = atob(normalized);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i += 1) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  return bytes;
+}
+
+function sanitizeFileName(name: string) {
+  return String(name || "material.pdf")
+    .trim()
+    .replace(/[^\w.\-]+/g, "_")
+    .replace(/_+/g, "_")
+    .replace(/^_+|_+$/g, "") || "material.pdf";
+}
+
+function buildStoragePath(scope: "students" | "teachers", userId: string, category: string, fileName: string) {
+  const safeCategory = sanitizeFileName(category || "files").replace(/[.]/g, "_");
+  const safeFileName = sanitizeFileName(fileName);
+  return `${scope}/${userId}/${safeCategory}/${Date.now()}-${safeFileName}`;
+}
+
+async function uploadBase64File({
+  bucketName,
+  objectPath,
+  fileBase64,
+  mimeType,
+}: {
+  bucketName: string;
+  objectPath: string;
+  fileBase64: string;
+  mimeType: string;
+}) {
+  const uploadedBytes = decodeBase64Payload(fileBase64);
+  const { error } = await adminClient().storage.from(bucketName).upload(objectPath, uploadedBytes, {
+    contentType: mimeType,
+    upsert: true,
+  });
+
+  if (error) {
+    throw error;
+  }
+
+  return uploadedBytes.length;
+}
+
+async function financeSummaryHandler(req: Request) {
+  try {
+    const { claims } = await authenticateRequest(req);
+    const userId = String(claims.sub || "");
+
+    const { data, error } = await adminClient()
+      .from("student_finance_status")
+      .select("*")
+      .eq("user_id", userId)
+      .maybeSingle();
+
+    if (error && !isMissingTableError(error)) {
+      throw error;
+    }
+
+    const finance = data ? mapFinanceStatusRow(data as FinanceStatusRow) : mapFinanceStatusRow({ balance_cents: 0, paid_cents: 0, due_cents: 0, fees_cleared: true });
+
+    return corsResponse({ summary: finance }, 200);
+  } catch (error) {
+    return corsResponse(
+      { error: error instanceof Error ? error.message : "Failed to load finance summary." },
+      Number((error as { statusCode?: number })?.statusCode || 500)
+    );
+  }
+}
+
+async function listStaffMaterialsHandler(req: Request) {
+  try {
+    await authenticateRequest(req);
+    const { data, error } = await adminClient()
+      .from("staff_materials")
+      .select("*")
+      .order("uploaded_at", { ascending: false });
+
+    if (error) {
+      if (isMissingTableError(error)) {
+        return corsResponse({ materials: [] }, 200);
+      }
+      throw error;
+    }
+
+    return corsResponse({ materials: (data || []).map((row) => mapStaffMaterialRow(row as StaffMaterialRow)) }, 200);
+  } catch (error) {
+    return corsResponse(
+      { error: error instanceof Error ? error.message : "Failed to load materials." },
+      Number((error as { statusCode?: number })?.statusCode || 500)
+    );
+  }
+}
+
+async function createStaffMaterialHandler(req: Request) {
+  try {
+    const { claims } = await requireStaffRole(req);
+    const body = await getJsonBody(req);
+    const title = String(body.title || "").trim();
+    const courseCode = String(body.courseCode || body.course_code || "").trim();
+    const audience = String(body.audience || "students").trim();
+    const summary = String(body.summary || "").trim();
+    const fileLabel = String(body.fileLabel || body.file_label || title || "Material").trim();
+    const storagePath = String(body.storagePath || body.storage_path || "").trim() || null;
+    const mimeType = String(body.mimeType || body.mime_type || "application/pdf").trim();
+    const originalFileName = String(body.originalFileName || body.original_file_name || "").trim() || null;
+    const fileSize = Number(body.fileSize || body.file_size || 0) || null;
+    const fileBase64 = String(body.fileBase64 || body.file_base64 || "").trim();
+
+    if (!title || !courseCode || !summary) {
+      return corsResponse({ error: "title, courseCode, and summary are required." }, 400);
+    }
+
+    const { data: userRow } = await adminClient()
+      .from("users")
+      .select("full_name, email, staff_number")
+      .eq("id", String(claims.sub))
+      .maybeSingle();
+
+    const author = String((userRow as { full_name?: string | null } | null)?.full_name || claims.email || "Staff");
+    const bucketName = getEnv("TEACHER_FILES_BUCKET") || getEnv("STAFF_MATERIALS_BUCKET") || "campus-files";
+    let nextStoragePath = storagePath;
+
+    if (fileBase64) {
+      const safeName = sanitizeFileName(originalFileName || fileLabel || `${title}.pdf`);
+      const objectPath = buildStoragePath("teachers", String(claims.sub), "materials", safeName);
+      await uploadBase64File({
+        bucketName,
+        objectPath,
+        fileBase64,
+        mimeType,
+      });
+      nextStoragePath = objectPath;
+    }
+
+    const payload = {
+      title,
+      course_code: courseCode,
+      audience,
+      author,
+      summary,
+      file_label: fileLabel,
+      storage_path: nextStoragePath,
+      mime_type: mimeType,
+      original_file_name: originalFileName,
+      file_size: fileSize,
+      uploaded_by: String(claims.sub),
+      uploaded_at: nowIso(),
+      is_published: true,
+    };
+
+    const { data, error } = await adminClient().from("staff_materials").insert(payload).select("*").single();
+    if (error) {
+      if (isMissingTableError(error)) {
+        return corsResponse({ error: "Missing staff_materials table." }, 500);
+      }
+      throw error;
+    }
+
+    await adminClient().from("notes").insert({
+      title,
+      course_code: courseCode,
+      author,
+      summary,
+      file_label: fileLabel,
+      storage_path: nextStoragePath,
+      uploaded_at: nowIso(),
+    });
+
+    return corsResponse({ material: mapStaffMaterialRow(data as StaffMaterialRow) }, 201);
+  } catch (error) {
+    return corsResponse(
+      { error: error instanceof Error ? error.message : "Failed to upload material." },
+      Number((error as { statusCode?: number })?.statusCode || 500)
+    );
+  }
+}
+
+async function listStudentDocumentsHandler(req: Request) {
+  try {
+    const { claims } = await authenticateRequest(req);
+    const userId = String(claims.sub || "");
+    const { data, error } = await adminClient()
+      .from("student_documents")
+      .select("*")
+      .eq("user_id", userId)
+      .order("created_at", { ascending: false });
+
+    if (error) {
+      if (isMissingTableError(error)) {
+        return corsResponse({ documents: [] }, 200);
+      }
+      throw error;
+    }
+
+    return corsResponse({ documents: (data || []).map((row) => mapStudentDocumentRow(row as StudentDocumentRow)) }, 200);
+  } catch (error) {
+    return corsResponse(
+      { error: error instanceof Error ? error.message : "Failed to load documents." },
+      Number((error as { statusCode?: number })?.statusCode || 500)
+    );
+  }
+}
+
+async function createStudentDocumentHandler(req: Request) {
+  try {
+    const { claims } = await authenticateRequest(req);
+    const body = await getJsonBody(req);
+    const documentType = String(body.documentType || body.document_type || "").trim().toLowerCase();
+    const fileName = String(body.fileName || body.file_name || `${documentType || "document"}.pdf`).trim();
+    const mimeType = String(body.mimeType || body.mime_type || "application/pdf").trim();
+    const fileBase64 = String(body.fileBase64 || body.file_base64 || "").trim();
+    const feesClearedValue = body.feesCleared ?? body.fees_cleared ?? null;
+    const feesCleared =
+      typeof feesClearedValue === "boolean"
+        ? feesClearedValue
+        : String(feesClearedValue || "").toLowerCase() === "true";
+
+    if (!documentType || !fileName || !fileBase64) {
+      return corsResponse({ error: "documentType, fileName, and fileBase64 are required." }, 400);
+    }
+
+    const supportedDocumentTypes = new Set(["gatepass", "exam-card", "transcript"]);
+    if (!supportedDocumentTypes.has(documentType)) {
+      return corsResponse({ error: "Unsupported document type." }, 400);
+    }
+
+    const bucketName = getEnv("STUDENT_FILES_BUCKET") || getEnv("DOCUMENTS_BUCKET") || "campus-files";
+    const safeName = sanitizeFileName(fileName);
+    const objectPath = buildStoragePath("students", String(claims.sub), documentType, safeName);
+    const fileSize = await uploadBase64File({
+      bucketName,
+      objectPath,
+      fileBase64,
+      mimeType,
+    });
+
+    const payload = {
+      user_id: String(claims.sub),
+      document_type: documentType,
+      file_name: safeName,
+      mime_type: mimeType,
+      storage_path: objectPath,
+      file_size: fileSize,
+      fees_cleared: feesCleared,
+      uploaded_by: String(claims.sub),
+      created_at: nowIso(),
+    };
+
+    const { data, error } = await adminClient().from("student_documents").insert(payload).select("*").single();
+    if (error) {
+      if (isMissingTableError(error)) {
+        return corsResponse({ error: "Missing student_documents table." }, 500);
+      }
+      throw error;
+    }
+
+    return corsResponse({ document: mapStudentDocumentRow(data as StudentDocumentRow) }, 201);
+  } catch (error) {
+    return corsResponse(
+      { error: error instanceof Error ? error.message : "Failed to save document." },
+      Number((error as { statusCode?: number })?.statusCode || 500)
+    );
+  }
+}
+
+async function createStaffAnnouncementHandler(req: Request) {
+  try {
+    const { claims } = await requireStaffRole(req);
+    const body = await getJsonBody(req);
+    const title = String(body.title || "").trim();
+    const bodyText = String(body.body || body.message || "").trim();
+    const audience = String(body.audience || "all students").trim();
+    const priority = String(body.priority || "normal").trim();
+
+    if (!title || !bodyText) {
+      return corsResponse({ error: "title and body are required." }, 400);
+    }
+
+    const author = String(claims.email || "Staff");
+    const { data, error } = await adminClient()
+      .from("announcements")
+      .insert({
+        title,
+        body: bodyText,
+        audience,
+        author,
+        priority,
+        published_at: nowIso(),
+      })
+      .select("*")
+      .single();
+
+    if (error) {
+      if (isMissingTableError(error)) {
+        return corsResponse({ error: "Missing announcements table." }, 500);
+      }
+      throw error;
+    }
+
+    return corsResponse({ announcement: data }, 201);
+  } catch (error) {
+    return corsResponse(
+      { error: error instanceof Error ? error.message : "Failed to create announcement." },
+      Number((error as { statusCode?: number })?.statusCode || 500)
+    );
+  }
+}
+
+async function createStaffTimetableHandler(req: Request) {
+  try {
+    const { claims } = await requireStaffRole(req);
+    const body = await getJsonBody(req);
+    const audience = String(body.audience || "students").trim();
+    const day = String(body.day || "").trim();
+    const time = String(body.time || "").trim();
+    const title = String(body.title || "").trim();
+    const venue = String(body.venue || "").trim();
+    const courseCode = String(body.courseCode || body.course_code || "").trim();
+    const lecturer = String(body.lecturer || claims.email || "Staff").trim();
+    const status = String(body.status || "upcoming").trim();
+    const dayOrder = Number(body.dayOrder || body.day_order || 0);
+
+    if (!day || !time || !title || !venue || !courseCode) {
+      return corsResponse({ error: "day, time, title, venue, and courseCode are required." }, 400);
+    }
+
+    const { data, error } = await adminClient()
+      .from("timetable_entries")
+      .insert({
+        audience,
+        day,
+        day_order: Number.isFinite(dayOrder) ? dayOrder : 0,
+        time,
+        title,
+        venue,
+        course_code: courseCode,
+        lecturer,
+        status,
+        created_at: nowIso(),
+      })
+      .select("*")
+      .single();
+
+    if (error) {
+      if (isMissingTableError(error)) {
+        return corsResponse({ error: "Missing timetable_entries table." }, 500);
+      }
+      throw error;
+    }
+
+    return corsResponse({ timetableEntry: data }, 201);
+  } catch (error) {
+    return corsResponse(
+      { error: error instanceof Error ? error.message : "Failed to create timetable entry." },
+      Number((error as { statusCode?: number })?.statusCode || 500)
+    );
+  }
+}
+
+async function sessionsListHandler(req: Request) {
+  try {
+    const { claims, sessionId } = await authenticateRequest(req);
+    const userId = String(claims.sub || "");
+    const sessions = await listDeviceSessions(userId);
+
+    return corsResponse(
+      {
+        sessions: sessions.map((session) => ({
+          id: session.id,
+          deviceName: session.device_name || "Unknown device",
+          userAgent: session.user_agent || null,
+          ipAddress: session.ip_address || null,
+          locationLabel: summarizeLocation(session.ip_location || null),
+          city: session.ip_location?.city || session.ip_city || null,
+          region: session.ip_location?.region || session.ip_region || null,
+          country: session.ip_location?.country || session.ip_country || null,
+          createdAt: session.created_at || null,
+          lastSeenAt: session.last_seen_at || null,
+          revokedAt: session.revoked_at || null,
+          revokedReason: session.revoked_reason || null,
+          isCurrent: sessionId ? session.id === sessionId : false,
+        })),
+      },
+      200
+    );
+  } catch (error) {
+    return corsResponse(
+      { error: error instanceof Error ? error.message : "Failed to load sessions." },
+      Number((error as { statusCode?: number })?.statusCode || 500)
+    );
+  }
+}
+
+async function revokeSessionHandler(req: Request, sessionId: string) {
+  try {
+    const { claims, sessionId: currentSessionId } = await authenticateRequest(req);
+    const userId = String(claims.sub || "");
+    if (!sessionId) {
+      return corsResponse({ error: "sessionId is required." }, 400);
+    }
+
+    if (currentSessionId && sessionId === currentSessionId) {
+      return corsResponse({ error: "You cannot revoke the current session from this endpoint." }, 400);
+    }
+
+    await revokeDeviceSession(userId, sessionId, "revoked_by_user");
+    return corsResponse({ success: true }, 200);
+  } catch (error) {
+    return corsResponse(
+      { error: error instanceof Error ? error.message : "Failed to revoke session." },
+      Number((error as { statusCode?: number })?.statusCode || 500)
+    );
+  }
+}
+
+async function revokeOtherSessionsHandler(req: Request) {
+  try {
+    const { claims, sessionId } = await authenticateRequest(req);
+    const userId = String(claims.sub || "");
+    if (!sessionId) {
+      return corsResponse({ error: "Current session is unavailable." }, 400);
+    }
+
+    await revokeOtherDeviceSessions(userId, sessionId);
+    return corsResponse({ success: true }, 200);
+  } catch (error) {
+    return corsResponse(
+      { error: error instanceof Error ? error.message : "Failed to revoke other sessions." },
+      Number((error as { statusCode?: number })?.statusCode || 500)
+    );
+  }
+}
+
+async function refreshHandler(req: Request) {
+  const body = await getJsonBody(req);
+  const refreshToken = String(body.refreshToken || "").trim();
+  if (!refreshToken) {
+    return corsResponse({ error: "refreshToken is required." }, 400);
+  }
+
+  try {
+    const claims = verifyToken(refreshToken);
+    if (!claims?.sub) {
+      return corsResponse({ error: "Invalid or expired refresh token." }, 401);
+    }
+
+    if (String(claims.token_kind || claims.type || "").toLowerCase() !== "refresh") {
+      return corsResponse({ error: "Invalid refresh token." }, 401);
+    }
+
+    const sessionId = String(claims.sid || claims.session_id || "");
+    if (!sessionId) {
+      return corsResponse({ error: "Invalid refresh token." }, 401);
+    }
+
+    const { data, error } = await adminClient()
+      .from("device_sessions")
+      .select("*")
+      .eq("id", sessionId)
+      .eq("user_id", String(claims.sub))
+      .maybeSingle();
+
+    if (error && !isMissingTableError(error)) {
+      throw error;
+    }
+
+    if (data && (data as SessionRow).revoked_at) {
+      return corsResponse({ error: "This session has been revoked." }, 401);
+    }
+
+    const userTables = ["users", "registration"];
+    let userRow: UserRow | null = null;
+    for (const table of userTables) {
+      const { data: row, error: rowError } = await adminClient()
+        .from(table)
+        .select("*")
+        .eq("id", String(claims.sub))
+        .maybeSingle();
+
+      if (rowError) {
+        if (isMissingTableError(rowError)) continue;
+        throw rowError;
+      }
+
+      if (row) {
+        userRow = row as UserRow;
+        break;
+      }
+    }
+
+    if (!userRow) {
+      return corsResponse({ error: "Profile not found." }, 404);
+    }
+
+    const user = publicUser(userRow);
+    const newAccessToken = signToken(
+      { sub: user.id, email: user.email, role: user.role, source: String(claims.source || "legacy"), sid: sessionId, token_kind: "access" },
+      60 * 60 * 24 * 7
+    );
+
+    return corsResponse(
+      {
+        success: true,
+        token: newAccessToken,
+        refreshToken,
+        user,
+      },
+      200
+    );
+  } catch (error) {
+    return corsResponse(
+      { error: error instanceof Error ? error.message : "Failed to refresh session." },
+      Number((error as { statusCode?: number })?.statusCode || 500)
+    );
   }
 }
 
@@ -1085,15 +2078,55 @@ Deno.serve(async (req) => {
       }
 
       const { challengeId, code } = await createOtpChallenge({ email, purpose: "login", req });
-      const token = String((loginJson as { token?: string }).token || "");
-      const refreshToken = String((loginJson as { refreshToken?: string }).refreshToken || "");
+      const sessionId = randomUUID();
+      const token = signToken(
+        {
+          sub: String((loginJson.user as { id?: string } | undefined)?.id || ""),
+          email,
+          role: String((loginJson.user as { role?: string } | undefined)?.role || "student"),
+          source: "users",
+          sid: sessionId,
+          token_kind: "access",
+        },
+        60 * 60 * 24 * 7
+      );
+      const refreshToken = signToken(
+        {
+          sub: String((loginJson.user as { id?: string } | undefined)?.id || ""),
+          email,
+          role: String((loginJson.user as { role?: string } | undefined)?.role || "student"),
+          source: "users",
+          sid: sessionId,
+          token_kind: "refresh",
+        },
+        60 * 60 * 24 * 30
+      );
+      const requestIp = getRequestIp(req);
+      const userAgent = getRequestUserAgent(req);
+      const ipLocation = await lookupIpLocation(requestIp);
 
       pendingLoginChallenges.set(challengeId, {
         email,
         user: loginJson.user as Record<string, unknown>,
         token,
         refreshToken,
-        createdAt: new Date().toISOString(),
+        createdAt: nowIso(),
+        sessionId,
+        requestIp,
+        userAgent,
+        ipLocation,
+      });
+
+      await storeLoginOtpSession({
+        challengeId,
+        email,
+        user: loginJson.user as Record<string, unknown>,
+        token,
+        refreshToken,
+        sessionId,
+        requestIp,
+        userAgent,
+        ipLocation,
       });
 
       const response: JsonObject = {
@@ -1124,19 +2157,51 @@ Deno.serve(async (req) => {
       }
 
       const pendingLogin = pendingLoginChallenges.get(challengeId);
-      if (!pendingLogin) {
+      const loginSession = pendingLogin
+        ? {
+            email: pendingLogin.email,
+            token: pendingLogin.token,
+            refresh_token: pendingLogin.refreshToken,
+            user_payload: pendingLogin.user,
+            created_at: pendingLogin.createdAt,
+            consumed_at: null as string | null,
+          }
+        : await loadLoginOtpSession(challengeId);
+
+      if (!loginSession?.email || !loginSession.token || !loginSession.refresh_token || !loginSession.user_payload) {
+        return corsResponse({ error: "This login request has expired. Please sign in again." }, 410);
+      }
+
+      if (loginSession.consumed_at) {
+        return corsResponse({ error: "This login request has already been used." }, 410);
+      }
+
+      const sessionAgeMs = loginSession.created_at ? Date.now() - new Date(loginSession.created_at).getTime() : 0;
+      if (sessionAgeMs > OTP_EXPIRY_MINUTES * 60 * 1000) {
+        await consumeLoginOtpSession(challengeId);
+        pendingLoginChallenges.delete(challengeId);
         return corsResponse({ error: "This login request has expired. Please sign in again." }, 410);
       }
 
       await verifyOtpChallenge({
-        email: pendingLogin.email,
+        email: loginSession.email,
         challengeId,
         code,
         purpose: "login",
       });
 
       pendingLoginChallenges.delete(challengeId);
-      return corsResponse({ token: pendingLogin.token, refreshToken: pendingLogin.refreshToken, user: pendingLogin.user }, 200);
+      await consumeLoginOtpSession(challengeId);
+      const sessionId = loginSession?.session_id ? String(loginSession.session_id) : pendingLogin?.sessionId || "";
+      if (sessionId) {
+        await saveLoginSession({
+          sessionId,
+          userId: String((loginSession.user_payload as JsonObject).id || pendingLogin?.user?.id || ""),
+          tokenKind: "access",
+          req,
+        });
+      }
+      return corsResponse({ token: loginSession.token, refreshToken: loginSession.refresh_token, user: loginSession.user_payload }, 200);
     }
 
     if (path === "/auth/password-reset/request") {
@@ -1147,12 +2212,60 @@ Deno.serve(async (req) => {
       return await passwordResetConfirmHandler(req);
     }
 
+    if (path === "/auth/refresh") {
+      return await refreshHandler(req);
+    }
+
     if (path === "/auth/me") {
       return await meHandler(req);
     }
 
     if (path === "/auth/profile") {
       return await profileUpdateHandler(req);
+    }
+
+    if (path === "/finance/summary") {
+      return await financeSummaryHandler(req);
+    }
+
+    if (path === "/auth/sessions") {
+      return await sessionsListHandler(req);
+    }
+
+    if (path === "/auth/sessions/revoke-others") {
+      return await revokeOtherSessionsHandler(req);
+    }
+
+    if (path.startsWith("/auth/sessions/") && path.endsWith("/revoke")) {
+      const sessionId = path.split("/").filter(Boolean)[2] || "";
+      return await revokeSessionHandler(req, sessionId);
+    }
+
+    if (path === "/student/documents") {
+      if (req.method === "GET") {
+        return await listStudentDocumentsHandler(req);
+      }
+      if (req.method === "POST") {
+        return await createStudentDocumentHandler(req);
+      }
+    }
+
+    if (path === "/staff/materials") {
+      if (req.method === "GET") {
+        return await listStaffMaterialsHandler(req);
+      }
+
+      if (req.method === "POST") {
+        return await createStaffMaterialHandler(req);
+      }
+    }
+
+    if (path === "/staff/announcements" && req.method === "POST") {
+      return await createStaffAnnouncementHandler(req);
+    }
+
+    if (path === "/staff/timetable" && req.method === "POST") {
+      return await createStaffTimetableHandler(req);
     }
 
     return corsResponse({ error: "Not found." }, 404);
