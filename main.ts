@@ -33,7 +33,7 @@ const CORS_HEADERS = {
   "Vary": "Origin",
 };
 
-const OTP_EXPIRY_MINUTES = Number(Deno.env.get("OTP_EXPIRY_MINUTES") || 10);
+const OTP_EXPIRY_MINUTES = Number(Deno.env.get("OTP_EXPIRY_MINUTES") || 30);
 const OTP_MAX_ATTEMPTS = Number(Deno.env.get("OTP_MAX_ATTEMPTS") || 5);
 const OTP_REQUEST_LIMIT = Number(Deno.env.get("OTP_REQUEST_LIMIT") || 3);
 const OTP_REQUEST_WINDOW_MINUTES = Number(Deno.env.get("OTP_REQUEST_WINDOW_MINUTES") || 15);
@@ -46,6 +46,7 @@ const pendingLoginChallenges = new Map<
     token: string;
     refreshToken: string;
     createdAt: string;
+    expiresAt: string;
     sessionId: string;
     requestIp: string | null;
     userAgent: string | null;
@@ -80,6 +81,15 @@ type LoginOtpSessionRow = {
   created_at?: string | null;
   expires_at?: string | null;
   consumed_at?: string | null;
+};
+
+type LoginTicketClaims = JsonObject & {
+  challenge_id?: string;
+  email?: string;
+  token?: string;
+  refresh_token?: string;
+  user_payload?: JsonObject;
+  expires_at?: string;
 };
 
 type FinanceStatusRow = {
@@ -170,6 +180,52 @@ function normalizePath(pathname: string) {
 
 function getEnv(name: string) {
   return String(Deno.env.get(name) || "").trim();
+}
+
+function signLoginTicket(payload: JsonObject) {
+  return signToken(payload, 60 * 60 * 24);
+}
+
+function buildLoginTicket({
+  challengeId,
+  email,
+  token,
+  refreshToken,
+  user,
+  sessionId,
+  expiresAt,
+}: {
+  challengeId: string;
+  email: string;
+  token: string;
+  refreshToken: string;
+  user: Record<string, unknown>;
+  sessionId: string;
+  expiresAt: string;
+}) {
+  return signLoginTicket({
+    challenge_id: challengeId,
+    email,
+    token,
+    refresh_token: refreshToken,
+    user_payload: user,
+    sid: sessionId,
+    expires_at: expiresAt,
+    token_kind: "login_ticket",
+  });
+}
+
+function verifyLoginTicket(ticket: string): LoginTicketClaims | null {
+  const claims = verifyToken(ticket);
+  if (!claims) {
+    return null;
+  }
+
+  if (!claims.challenge_id || !claims.email || !claims.token || !claims.refresh_token || !claims.user_payload) {
+    return null;
+  }
+
+  return claims as LoginTicketClaims;
 }
 
 async function storeLoginOtpSession({
@@ -2104,6 +2160,7 @@ Deno.serve(async (req) => {
       const requestIp = getRequestIp(req);
       const userAgent = getRequestUserAgent(req);
       const ipLocation = await lookupIpLocation(requestIp);
+      const expiresAt = new Date(Date.now() + OTP_EXPIRY_MINUTES * 60 * 1000).toISOString();
 
       pendingLoginChallenges.set(challengeId, {
         email,
@@ -2111,6 +2168,7 @@ Deno.serve(async (req) => {
         token,
         refreshToken,
         createdAt: nowIso(),
+        expiresAt,
         sessionId,
         requestIp,
         userAgent,
@@ -2129,9 +2187,20 @@ Deno.serve(async (req) => {
         ipLocation,
       });
 
+      const loginTicket = buildLoginTicket({
+        challengeId,
+        email,
+        token,
+        refreshToken,
+        user: loginJson.user as Record<string, unknown>,
+        sessionId,
+        expiresAt,
+      });
+
       const response: JsonObject = {
         success: true,
         challengeId,
+        loginTicket,
         email,
         channel: "email",
         availableChannels: ["email"],
@@ -2151,12 +2220,14 @@ Deno.serve(async (req) => {
       const body = await getJsonBody(req);
       const challengeId = String(body.challengeId || "").trim();
       const code = String(body.code || body.otpCode || "").trim();
+      const loginTicket = String(body.loginTicket || "").trim();
 
       if (!challengeId || !code) {
         return corsResponse({ error: "challengeId and code are required." }, 400);
       }
 
       const pendingLogin = pendingLoginChallenges.get(challengeId);
+      const ticketClaims = loginTicket ? verifyLoginTicket(loginTicket) : null;
       const loginSession = pendingLogin
         ? {
             email: pendingLogin.email,
@@ -2164,27 +2235,40 @@ Deno.serve(async (req) => {
             refresh_token: pendingLogin.refreshToken,
             user_payload: pendingLogin.user,
             created_at: pendingLogin.createdAt,
+            expires_at: pendingLogin.expiresAt,
             consumed_at: null as string | null,
           }
         : await loadLoginOtpSession(challengeId);
 
-      if (!loginSession?.email || !loginSession.token || !loginSession.refresh_token || !loginSession.user_payload) {
+      const effectiveLoginSession = loginSession || (ticketClaims
+        ? {
+            email: ticketClaims.email || "",
+            token: ticketClaims.token || "",
+            refresh_token: ticketClaims.refresh_token || "",
+            user_payload: ticketClaims.user_payload || null,
+            created_at: nowIso(),
+            expires_at: ticketClaims.expires_at || new Date(Date.now() + OTP_EXPIRY_MINUTES * 60 * 1000).toISOString(),
+            consumed_at: null as string | null,
+          }
+        : null);
+
+      if (!effectiveLoginSession?.email || !effectiveLoginSession.token || !effectiveLoginSession.refresh_token || !effectiveLoginSession.user_payload) {
         return corsResponse({ error: "This login request has expired. Please sign in again." }, 410);
       }
 
-      if (loginSession.consumed_at) {
+      if (effectiveLoginSession.consumed_at) {
         return corsResponse({ error: "This login request has already been used." }, 410);
       }
 
-      const sessionAgeMs = loginSession.created_at ? Date.now() - new Date(loginSession.created_at).getTime() : 0;
-      if (sessionAgeMs > OTP_EXPIRY_MINUTES * 60 * 1000) {
+      const expiresAt = effectiveLoginSession.expires_at || pendingLogin?.expiresAt || ticketClaims?.expires_at || null;
+      if (expiresAt && new Date(expiresAt).getTime() <= Date.now()) {
         await consumeLoginOtpSession(challengeId);
         pendingLoginChallenges.delete(challengeId);
         return corsResponse({ error: "This login request has expired. Please sign in again." }, 410);
       }
 
       await verifyOtpChallenge({
-        email: loginSession.email,
+        email: effectiveLoginSession.email,
         challengeId,
         code,
         purpose: "login",
@@ -2192,16 +2276,16 @@ Deno.serve(async (req) => {
 
       pendingLoginChallenges.delete(challengeId);
       await consumeLoginOtpSession(challengeId);
-      const sessionId = loginSession?.session_id ? String(loginSession.session_id) : pendingLogin?.sessionId || "";
+      const sessionId = pendingLogin?.sessionId || String(ticketClaims?.sid || "") || "";
       if (sessionId) {
         await saveLoginSession({
           sessionId,
-          userId: String((loginSession.user_payload as JsonObject).id || pendingLogin?.user?.id || ""),
+          userId: String((effectiveLoginSession.user_payload as JsonObject).id || pendingLogin?.user?.id || ticketClaims?.user_payload?.id || ""),
           tokenKind: "access",
           req,
         });
       }
-      return corsResponse({ token: loginSession.token, refreshToken: loginSession.refresh_token, user: loginSession.user_payload }, 200);
+      return corsResponse({ token: effectiveLoginSession.token, refreshToken: effectiveLoginSession.refresh_token, user: effectiveLoginSession.user_payload }, 200);
     }
 
     if (path === "/auth/password-reset/request") {
